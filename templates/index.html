@@ -33,7 +33,7 @@
 </div>
 <div id="toast" class="toast"></div><div id="coins" class="coins"></div><audio id="audio" preload="auto" playsinline></audio>
 <script>
-const $=id=>document.getElementById(id);let state=null,token=localStorage.getItem('bingoToken')||'',polling=false,lastAnnouncement='',lastCallAt=0,voiceUnlocked=false,currentObjectUrl='';const audioCache=new Map(),audioLoading=new Map();
+const $=id=>document.getElementById(id);let state=null,token=localStorage.getItem('bingoToken')||'',polling=false,lastAnnouncement='',lastCallAt=0,voiceUnlocked=false,audioCtx=null,currentSource=null,autoTickBusy=false;const audioCache=new Map(),audioLoading=new Map();
 for(let i=2;i<=20;i++)$('max').insertAdjacentHTML('beforeend',`<option ${i===20?'selected':''}>${i}</option>`);
 const esc=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 function toast(m){$('toast').textContent=m;$('toast').classList.add('show');setTimeout(()=>$('toast').classList.remove('show'),2300)}
@@ -48,30 +48,46 @@ function render(){if(!state)return;const called=new Set(state.called),marked=new
 $('hostControls').classList.toggle('hidden',!state.is_host);$('start').classList.toggle('hidden',state.status!=='lobby');$('call').classList.toggle('hidden',state.status!=='playing'||state.call_mode!=='manual');$('nextRound').classList.toggle('hidden',state.status!=='finished');$('players').innerHTML=state.leaderboard.map(p=>`<div class="player"><span>${p.is_host?'👑 ':''}${esc(p.name)}${p.is_host?'<span class="host">Host</span>':''}</span><span class="money">${money(p.earnings)}</span></div>`).join('');$('myMoney').textContent=money(state.my_earnings);$('myWins').textContent=`${state.my_wins} prize win${state.my_wins===1?'':'s'}`;$('leaderboard').innerHTML=state.leaderboard.map((p,i)=>`<div class="leader"><span>${['🥇','🥈','🥉'][i]||i+1+'.'} ${esc(p.name)}</span><b>${money(p.earnings)}</b></div>`).join('');$('prizes').innerHTML=Object.values(state.prizes).map(p=>`<div class="prize ${p.status}"><strong>${esc(p.label)}</strong><div>${money(p.amount)}</div><small>${p.winners.length?p.winners.map(w=>`${esc(w.name)} ${money(w.share)}`).join('<br>'):(p.status==='closed'?'No winner':'Open')}</small></div>`).join('');$('headers').style.gridTemplateColumns=`repeat(${n},1fr)`;$('card').style.gridTemplateColumns=`repeat(${n},1fr)`;$('headers').innerHTML=state.headers.map(x=>`<div>${esc(x)}</div>`).join('');$('card').innerHTML=state.card.flat().map(c=>{if(c.free)return'<div class="cell free">★<br>FREE</div>';let cls='cell';if(called.has(c.value))cls+=' called';if(c.value===state.last_number&&!marked.has(c.value))cls+=' latest';if(marked.has(c.value))cls+=' marked';return`<button class="${cls}" data-n="${c.value}" ${marked.has(c.value)?'disabled':''}>${c.value}</button>`}).join('');document.querySelectorAll('[data-n]').forEach(b=>b.onclick=()=>mark(+b.dataset.n));$('called').innerHTML=Array.from({length:state.total_numbers},(_,i)=>`<div class="num ${called.has(i+1)?'on':''}">${i+1}</div>`).join('');const r=state.readiness;$('readyBox').classList.toggle('hidden',!r.number);$('readyTitle').textContent=r.number?`Ready ${r.ready}/${r.required} · ${r.remaining}s`:'';$('readyList').innerHTML=r.players.map(p=>`<span class="chip ${p.status}">${p.status==='marked'?'✓':p.status==='waiting'?'…':'—'} ${esc(p.name)}</span>`).join('');$('history').innerHTML=state.round_history.length?state.round_history.slice().reverse().map(h=>`<div class="history-item"><b>Round ${h.round}</b><br>${Object.entries(h.prizes).map(([k,w])=>`${esc(k)}: ${w.length?w.map(x=>esc(x.name)+' '+money(x.share)).join(', '):'—'}`).join('<br>')}</div>`).join(''):'<span style="color:var(--muted)">No completed rounds yet.</span>'}
 async function mark(n){if(state.marked.includes(n))return;const b=document.querySelector(`[data-n="${n}"]`);if(b)b.classList.add('marked');try{const j=await api('/api/mark',{number:n});state=j.state;render()}catch(e){toast(e.message);render()}}
 $('catch').onclick=async()=>{try{const j=await api('/api/catch-up',{});state=j.state;render();toast(`Marked ${j.marked} missed number(s)`)}catch(e){toast(e.message)}};$('bingo').onclick=async()=>{try{const j=await api('/api/bingo',{});state=j.state;render();coinShower();toast('BINGO confirmed!')}catch(e){toast(e.message)}};$('start').onclick=async()=>{try{const j=await api('/api/start',{});state=j.state;render()}catch(e){toast(e.message)}};$('call').onclick=async()=>{try{$('call').disabled=true;const j=await api('/api/call',{});state=j.state;render()}catch(e){toast(e.message)}finally{$('call').disabled=false}};$('nextRound').onclick=async()=>{try{const j=await api('/api/next-round',{});state=j.state;render();toast('New round started')}catch(e){toast(e.message)}};
-async function waitForPlayable(audio,timeout=8000){
-  if(audio.readyState>=3)return;
-  await new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>{cleanup();reject(new Error('Audio loading timeout'))},timeout);
-    const ok=()=>{cleanup();resolve()};
-    const bad=()=>{cleanup();reject(new Error('Audio cannot be played'))};
-    const cleanup=()=>{clearTimeout(timer);audio.removeEventListener('canplay',ok);audio.removeEventListener('error',bad)};
-    audio.addEventListener('canplay',ok,{once:true});audio.addEventListener('error',bad,{once:true});
-  });
+async function ensureAudioContext(){
+  const AudioContextClass=window.AudioContext||window.webkitAudioContext;
+  if(!AudioContextClass)throw new Error('Web Audio is not supported on this browser');
+  if(!audioCtx)audioCtx=new AudioContextClass();
+  if(audioCtx.state==='suspended')await audioCtx.resume();
+  return audioCtx;
 }
+
 async function enableVoice(){
-  const a=$('audio');
   try{
-    a.pause();a.currentTime=0;a.src='/static/audio-unlock.wav?v=18';a.load();
-    await waitForPlayable(a,5000);await a.play();
+    const ctx=await ensureAudioContext();
+
+    // Start a tiny silent oscillator inside this direct tap. This permanently
+    // unlocks Web Audio on Chrome Android and Safari/iPhone.
+    const oscillator=ctx.createOscillator();
+    const gain=ctx.createGain();
+    gain.gain.value=0.00001;
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+    oscillator.start();
+    oscillator.stop(ctx.currentTime+0.04);
+
     voiceUnlocked=true;
-    $('voice').textContent='🎙 Voice: ON';$('voice').classList.add('voice-on');
+    $('voice').textContent='🎙 Voice: ON';
+    $('voice').classList.add('voice-on');
     toast('Human announcer enabled');
-    if(state?.announcement_id){await prepareAnnouncement(state.announcement_id,state.audio_url);await playAnnouncement(true)}
+
+    if(state?.announcement_id){
+      await prepareAnnouncement(state.announcement_id,state.audio_url);
+      await playAnnouncement(true);
+    }
   }catch(e){
-    voiceUnlocked=false;$('voice').textContent='🔊 Enable Voice';$('voice').classList.remove('voice-on');
-    toast('Audio permission failed. Turn up media volume and tap again.');
+    console.error('Voice unlock failed:',e);
+    voiceUnlocked=false;
+    $('voice').textContent='🔊 Enable Voice';
+    $('voice').classList.remove('voice-on');
+    toast('Voice permission failed. Raise media volume and tap again.');
   }
 }
+
 async function prepareAnnouncement(id,url){
   if(!id||!url)return null;
   if(audioCache.has(id))return audioCache.get(id);
@@ -91,15 +107,22 @@ async function prepareAnnouncement(id,url){
           const detail=info.detail?` ${info.detail}`:'';
           throw new Error((info.error||`Voice server ${response.status}`)+detail);
         }
-        const blob=await response.blob();
-        if(blob.size<500)throw new Error('Voice file is empty');
-        const objectUrl=URL.createObjectURL(blob);
-        audioCache.set(id,objectUrl);
-        return objectUrl;
+
+        const bytes=await response.arrayBuffer();
+        if(bytes.byteLength<500)throw new Error('Voice file is empty');
+
+        const ctx=await ensureAudioContext();
+        const decoded=await ctx.decodeAudioData(bytes.slice(0));
+        audioCache.set(id,decoded);
+
+        // Keep only recent decoded announcements to limit mobile memory.
+        if(audioCache.size>12){
+          const firstKey=audioCache.keys().next().value;
+          audioCache.delete(firstKey);
+        }
+        return decoded;
       }catch(e){
         lastError=e;
-        // Retry 503/temporary network failures. A signed URL cannot become 404
-        // just because room state changed.
         if(attempt<4)await new Promise(r=>setTimeout(r,900+attempt*900));
       }
     }
@@ -109,28 +132,71 @@ async function prepareAnnouncement(id,url){
   audioLoading.set(id,task);
   return task;
 }
+
 async function playAnnouncement(force){
-  if(!voiceUnlocked){if(force)toast('Tap Enable Voice first');return}
-  if(!state?.announcement_id||!state?.audio_url){if(force)toast('No announcement available yet');return}
+  if(!voiceUnlocked){
+    if(force)toast('Tap Enable Voice first');
+    return;
+  }
+  if(!state?.announcement_id||!state?.audio_url){
+    if(force)toast('No announcement available yet');
+    return;
+  }
+
   const id=state.announcement_id;
   try{
-    const objectUrl=await prepareAnnouncement(id,state.audio_url);
-    if(!voiceUnlocked||id!==state.announcement_id&&!force)return;
-    const a=$('audio');a.pause();a.currentTime=0;
-    if(currentObjectUrl&&currentObjectUrl!==objectUrl&&!audioCache.has(id))URL.revokeObjectURL(currentObjectUrl);
-    currentObjectUrl=objectUrl;a.src=objectUrl;a.load();await waitForPlayable(a,8000);await a.play();
+    const buffer=await prepareAnnouncement(id,state.audio_url);
+    if(!voiceUnlocked||(id!==state.announcement_id&&!force))return;
+
+    const ctx=await ensureAudioContext();
+    if(currentSource){
+      try{currentSource.stop()}catch{}
+      currentSource=null;
+    }
+
+    const source=ctx.createBufferSource();
+    source.buffer=buffer;
+    source.connect(ctx.destination);
+    source.onended=()=>{if(currentSource===source)currentSource=null};
+    currentSource=source;
+    source.start(0);
   }catch(e){
     console.error('Human voice playback failed:',e);
     toast('Natural voice failed: '+String(e.message||e).slice(0,180));
   }
 }
+
 $('voice').onclick=enableVoice;
 $('repeat').onclick=()=>playAnnouncement(true);
+
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden&&voiceUnlocked&&audioCtx?.state==='suspended'){
+    audioCtx.resume().catch(()=>{});
+  }
+});
+
 function leaveRoom(){if(!confirm('Leave this room? Your session on this phone will be removed.'))return;api('/api/leave',{}).catch(()=>{}).finally(()=>{token='';localStorage.removeItem('bingoToken');location.reload()})}$('leave').onclick=leaveRoom;
 $('copyCode').onclick=async()=>{await navigator.clipboard.writeText(state.code);toast('Room code copied')};async function shareRoom(){const text=`Join my Lucky Bingo room ${state.code}`;if(navigator.share){try{await navigator.share({title:'Lucky Bingo Pro',text,url:location.origin});return}catch{}}await navigator.clipboard.writeText(`${text} ${location.origin}`);toast('Invite copied')}$('invite').onclick=shareRoom;$('copyInvite').onclick=shareRoom;
 document.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>{const id=b.dataset.go;const el=id==='card'?$('card'):$(id);el?.scrollIntoView({behavior:'smooth',block:'start'})});
 function coinShower(){for(let i=0;i<(innerWidth<650?28:55);i++){const c=document.createElement('span');c.className='coin';c.textContent='🪙';c.style.left=Math.random()*100+'%';c.style.animationDelay=Math.random()*.55+'s';$('coins').appendChild(c);setTimeout(()=>c.remove(),3000)}}
 setInterval(()=>{$('ago').textContent=lastCallAt?`${Math.max(0,Math.floor((Date.now()-lastCallAt)/1000))} sec ago`:'Not started'},1000);
+async function autoHeartbeat(){
+  if(autoTickBusy||!token||!state?.is_host||state.status!=='playing'||state.call_mode!=='auto')return;
+  autoTickBusy=true;
+  try{
+    const j=await api('/api/auto-tick',{});
+    if(j.state&&j.state.version!==state.version){
+      state=j.state;
+      render();
+    }
+  }catch(e){
+    console.warn('Auto caller heartbeat:',e.message||e);
+  }finally{
+    autoTickBusy=false;
+  }
+}
+setInterval(autoHeartbeat,800);
+
 async function startPoll(){if(polling)return;polling=true;while(token){try{const r=await fetch(`/api/wait?token=${encodeURIComponent(token)}&version=${state?.version||0}`,{cache:'no-store'}),j=await r.json();if(!r.ok)throw Error(j.error);if(!j.unchanged&&j.state){const wins=state?.my_wins||0;state=j.state;render();if(state.my_wins>wins)coinShower()}}catch(e){await new Promise(r=>setTimeout(r,1200))}}polling=false}
 (async()=>{if(token){try{const j=await api('/api/restore',{token});showGame(j.state)}catch{token='';localStorage.removeItem('bingoToken')}}})();
 </script>

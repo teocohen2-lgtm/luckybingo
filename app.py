@@ -368,26 +368,50 @@ def require_player():
     return resolve_token(token)
 
 
+def advance_auto_room(room, current=None):
+    """Advance one automatic room safely.
+
+    This is called both by the server background loop and by a lightweight
+    heartbeat from the host browser. The browser heartbeat makes automatic
+    calling reliable on Render even after an instance wakes from sleep.
+    """
+    current = current or now()
+    if room['status'] != 'playing' or room['call_mode'] != 'auto':
+        return False
+
+    # The first ball must never depend on readiness from a previous call.
+    if not room['called']:
+        return perform_call(room)
+
+    ready = readiness(room)
+    if ready['all_ready']:
+        if room['ready_since'] is None:
+            room['ready_since'] = current
+            bump(room)
+            return False
+        if current >= room['ready_since'] + room['auto_interval']:
+            return perform_call(room)
+        return False
+
+    if ready['timed_out']:
+        return perform_call(room)
+
+    # Somebody who has the latest number still needs to mark it.
+    room['ready_since'] = None
+    return False
+
+
 def auto_loop():
     while True:
-        time.sleep(.4)
+        time.sleep(.5)
         with LOCK:
             current = now()
             for room in list(ROOMS.values()):
-                if room['status'] != 'playing' or room['call_mode'] != 'auto': continue
-                if not room['called']:
-                    if current >= room.get('next_auto_call_at', current + 999): perform_call(room)
-                    continue
-                r = readiness(room)
-                if r['all_ready']:
-                    if room['ready_since'] is None:
-                        room['ready_since'] = current; bump(room)
-                    due = room['ready_since'] + room['auto_interval']
-                elif r['timed_out']:
-                    due = current
-                else:
-                    room['ready_since'] = None; continue
-                if current >= due: perform_call(room)
+                try:
+                    advance_auto_room(room, current)
+                except Exception:
+                    app.logger.exception('Automatic caller loop failed for room %s', room.get('code'))
+
 
 threading.Thread(target=auto_loop, daemon=True).start()
 
@@ -456,8 +480,31 @@ def start():
         if pid!=room['host_id']: return jsonify(error='Host only.'),403
         if len(room['players'])<MIN_PLAYERS: return jsonify(error='At least 2 players are required.'),409
         if room['status']!='lobby': return jsonify(error='Round already started.'),409
-        room['status']='playing'; room['next_auto_call_at']=now()+2; room['message']='Game started. First ball is coming…'; bump(room)
+        room['status']='playing'
+        room['ready_since']=None
+        room['message']='Game started. First ball is coming…'
+        bump(room)
+
+        # Call the first ball immediately in automatic mode. Previously the
+        # first call depended only on a background thread, which could fail to
+        # wake reliably on hosted workers.
+        if room['call_mode']=='auto':
+            perform_call(room)
+
         return jsonify(ok=True,state=room_state(room,pid))
+
+@app.post('/api/auto-tick')
+def auto_tick():
+    """Host heartbeat fallback for Render/free-instance scheduling."""
+    room,p,pid=require_player()
+    if not room:
+        return jsonify(error='Not connected.'),404
+    with LOCK:
+        if pid!=room['host_id']:
+            return jsonify(error='Host only.'),403
+        changed=advance_auto_room(room)
+        return jsonify(ok=True,called=bool(changed),state=room_state(room,pid))
+
 
 @app.post('/api/call')
 def call():
