@@ -151,6 +151,10 @@
     .toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(30px); opacity:0; pointer-events:none; z-index:50; max-width:calc(100% - 32px); background:#152b47; border:1px solid rgba(255,255,255,.14); color:white; padding:12px 17px; border-radius:12px; box-shadow:var(--shadow); transition:.2s ease; }
     .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
     .toast.error { border-color:rgba(255,93,105,.5); color:#ffb3b8; }
+
+    .caller-settings{display:grid;grid-template-columns:1fr 1fr;gap:10px}.readiness-panel{margin:12px 0;padding:12px;border-radius:14px;background:#071829;border:1px solid var(--line)}.readiness-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:9px}.readiness-head strong{font-size:14px}.ready-progress{font-size:12px;color:var(--muted)}.ready-list{display:flex;flex-wrap:wrap;gap:7px}.ready-chip{padding:7px 9px;border-radius:999px;font-size:12px;font-weight:800;border:1px solid var(--line);background:#0b2138}.ready-chip.marked{border-color:rgba(55,211,153,.7);color:#7df0bd}.ready-chip.waiting{border-color:rgba(255,211,77,.8);color:#ffe58b;animation:latestPulse 1s ease-in-out infinite}.ready-chip.not_on_card{opacity:.55}.auto-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;background:rgba(55,211,153,.12);border:1px solid rgba(55,211,153,.4);font-size:11px;font-weight:900;color:#7df0bd}.countdown{font-variant-numeric:tabular-nums}.callBtnWaiting{opacity:.65!important}.mode-note{font-size:11px;color:var(--muted);margin-top:5px}
+    @media(max-width:600px){.caller-settings{grid-template-columns:1fr}.readiness-panel{padding:10px}.ready-list{gap:5px}.ready-chip{padding:6px 8px;font-size:11px}}
+
     @media (max-width: 1050px) { .game-grid { grid-template-columns:220px 1fr; } .numbers-panel { grid-column:1/-1; } .number-grid { grid-template-columns:repeat(15,1fr); } }
     @media (max-width: 760px) {
       .prize-grid{grid-template-columns:repeat(2,1fr)}
@@ -178,7 +182,7 @@
   <main class="shell">
     <div class="brand">
       <div class="brand-ball">B</div>
-      <div><h1>Lucky Bingo</h1><p>V10 Power Modes • 2 to 20 players</p></div>
+      <div><h1>Lucky Bingo</h1><p>V11 Smart Auto Caller • 2 to 20 players</p></div>
     </div>
 
     <section id="homeView" class="home-card">
@@ -200,6 +204,15 @@
             <option value="5" selected>5 × 5 — Classic Bingo (1–75)</option>
           </select>
         </div>
+        <div class="caller-settings">
+          <div class="field"><label>Number calling</label>
+            <select id="callMode"><option value="auto" selected>Auto announcer</option><option value="manual">Host clicks manually</option></select>
+          </div>
+          <div class="field" id="autoIntervalField"><label>Next call after everyone is ready</label>
+            <select id="autoInterval"><option value="3">3 seconds</option><option value="5" selected>5 seconds</option><option value="8">8 seconds</option><option value="10">10 seconds</option><option value="15">15 seconds</option></select>
+          </div>
+        </div>
+        <div class="mode-note">Only players who have the latest number must mark it. Players without it are automatically ready. A 25-second safety timeout prevents one player from stopping the game.</div>
         <button id="createBtn" class="primary">Create Bingo Room</button>
       </div>
       <div id="joinFields" class="hidden">
@@ -239,6 +252,10 @@
                 <button id="restartBtn" class="secondary hidden">New Round</button>
               </div>
             </div>
+          </div>
+          <div id="readinessPanel" class="readiness-panel hidden">
+            <div class="readiness-head"><strong id="readinessTitle">Waiting for players</strong><span id="readinessProgress" class="ready-progress"></span></div>
+            <div id="readyList" class="ready-list"></div>
           </div>
           <button id="markAllBtn" class="quick-mark-btn">⚡ CATCH UP — MARK MY CALLED NUMBERS</button>
           <div class="tiny" style="text-align:center;margin:6px 0 10px">Marks only numbers already called that exist on your card.</div>
@@ -287,8 +304,12 @@
     $('maxPlayers').appendChild(option);
   }
 
+  $('callMode').addEventListener('change', () => $('autoIntervalField').classList.toggle('hidden', $('callMode').value !== 'auto'));
+
   document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    $('callMode').addEventListener('change', () => $('autoIntervalField').classList.toggle('hidden', $('callMode').value !== 'auto'));
+
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
     btn.classList.add('active');
     const create = btn.dataset.tab === 'create';
     $('createFields').classList.toggle('hidden', !create);
@@ -523,10 +544,28 @@
     $('markAllBtn').disabled = state.status !== 'playing' || isPendingNumber || missingCalled.length === 0;
     $('markAllBtn').textContent = isPendingNumber ? '🎙️ ANNOUNCER IS CALLING…' : missingCalled.length ? `⚡ CATCH UP — MARK ${missingCalled.length} MISSED NUMBER${missingCalled.length === 1 ? '' : 'S'}` : '✓ CAUGHT UP — ALL CALLED NUMBERS MARKED';
 
+    const readiness = state.readiness || {players:[], ready:0, required:0, all_ready:true, deadline_remaining:0, can_advance:true};
+    const hasCurrentCall = state.status === 'playing' && readiness.number != null;
+    $('readinessPanel').classList.toggle('hidden', !hasCurrentCall);
+    if (hasCurrentCall) {
+      const waitingCount = readiness.players.filter(p => p.status === 'waiting').length;
+      $('readinessTitle').innerHTML = readiness.all_ready ? `✓ Everyone ready for ${readiness.number}` : `Waiting for ${waitingCount} player${waitingCount === 1 ? '' : 's'} to mark ${readiness.number}`;
+      const modeText = state.call_mode === 'auto' ? `Auto • next in ${readiness.all_ready ? state.auto_interval : readiness.deadline_remaining}s` : (readiness.can_advance ? 'Host can call next' : `${readiness.deadline_remaining}s safety timeout`);
+      $('readinessProgress').innerHTML = `${readiness.ready}/${readiness.required} ready • <span class="countdown">${modeText}</span>`;
+      $('readyList').innerHTML = readiness.players.map(p => {
+        const icon = p.status === 'marked' ? '✓' : p.status === 'waiting' ? '…' : '—';
+        const label = p.status === 'not_on_card' ? `${p.name} (not on card)` : p.name;
+        return `<span class="ready-chip ${p.status}">${icon} ${escapeHtml(label)}</span>`;
+      }).join('');
+    }
+
     $('hostActions').classList.toggle('hidden', !state.is_host);
     $('startBtn').classList.toggle('hidden', !(state.is_host && state.status === 'lobby'));
-    $('callBtn').classList.toggle('hidden', !(state.is_host && state.status === 'playing'));
-    $('callBtn').disabled = isPendingNumber;
+    $('callBtn').classList.toggle('hidden', !(state.is_host && state.status === 'playing' && state.call_mode !== 'auto'));
+    $('callBtn').disabled = isPendingNumber || (state.called_numbers.length > 0 && !readiness.can_advance);
+    $('callBtn').classList.toggle('callBtnWaiting', $('callBtn').disabled);
+    $('callBtn').textContent = (state.called_numbers.length > 0 && !readiness.can_advance) ? `Waiting ${readiness.ready}/${readiness.required}` : 'Call Next Number';
+    $('roundTitle').innerHTML = state.status === 'playing' && state.call_mode === 'auto' ? `Game in Progress <span class="auto-badge">● AUTO CALLER</span>` : $('roundTitle').textContent;
     $('restartBtn').classList.toggle('hidden', !(state.is_host && state.status === 'finished'));
     $('startBtn').disabled = state.player_count < state.min_players;
     $('bingoBtn').disabled = state.status !== 'playing';
@@ -580,7 +619,7 @@
 
   $('createBtn').onclick = async () => {
     try {
-      const data = await api('/api/create', {method:'POST', body:JSON.stringify({name:$('nameInput').value, max_players:$('maxPlayers').value, card_size:$('cardSize').value})});
+      const data = await api('/api/create', {method:'POST', body:JSON.stringify({name:$('nameInput').value, max_players:$('maxPlayers').value, card_size:$('cardSize').value, call_mode:$('callMode').value, auto_interval:$('autoInterval').value})});
       marked = new Set(); cardSignature=''; showGame(data.state);
     } catch (e) { toast(e.message, true); }
   };

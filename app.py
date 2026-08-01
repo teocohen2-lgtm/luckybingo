@@ -42,6 +42,8 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 VOICE = os.environ.get("BINGO_VOICE", "fil-PH-AngeloNeural")
 PRIZE_KEYS = ("row", "column", "diagonal", "all_out")
 PRIZE_LABELS = {"row": "Row", "column": "Column", "diagonal": "Diagonal", "all_out": "All Out"}
+AUTO_INTERVALS = (3, 5, 8, 10, 15)
+MAX_READY_WAIT = 25
 
 
 def bump(room):
@@ -219,6 +221,119 @@ def prize_public(room):
     return result
 
 
+def player_has_number(player, number):
+    return any((not cell["free"] and cell["value"] == number) for row in player["card"] for cell in row)
+
+
+def readiness_state(room):
+    number = room["called_numbers"][-1] if room["called_numbers"] else None
+    players = []
+    required = 0
+    ready = 0
+    if number is not None:
+        for pid, player in room["players"].items():
+            has_number = player_has_number(player, number)
+            if not has_number:
+                status = "not_on_card"
+            elif number in player["marked"]:
+                status = "marked"
+                required += 1
+                ready += 1
+            else:
+                status = "waiting"
+                required += 1
+            players.append({"id": pid, "name": player["name"], "status": status, "is_host": pid == room["host_id"]})
+    all_ready = number is None or ready >= required
+    deadline = float(room.get("call_deadline") or 0)
+    remaining = max(0, int(deadline - time.time() + 0.999)) if deadline else 0
+    timed_out = bool(deadline and time.time() >= deadline)
+    can_advance = number is None or all_ready or timed_out
+    return {
+        "number": number,
+        "players": players,
+        "required": required,
+        "ready": ready,
+        "all_ready": all_ready,
+        "deadline_remaining": remaining,
+        "timed_out": timed_out,
+        "can_advance": can_advance,
+    }
+
+
+def set_current_call_window(room):
+    room["call_started_at"] = time.time()
+    room["call_deadline"] = time.time() + MAX_READY_WAIT
+    room["ready_since"] = None
+    room["deadline_notified"] = False
+
+
+def perform_call_locked(room):
+    closed = close_pending_prizes(room)
+    if all(room["prizes"][key]["status"] == "closed" for key in PRIZE_KEYS):
+        room["status"] = "finished"
+        room["message"] = "All four prizes are frozen. The round is complete."
+        room["announcement"] = "Game complete! Congratulations to all our winners!"
+        room["announcement_id"] = uuid.uuid4().hex
+        room["announcement_kind"] = "system"
+        bump(room)
+        return False
+    if not room["available_numbers"]:
+        room["status"] = "finished"
+        room["message"] = "All available card numbers have been called. The round is complete."
+        room["announcement"] = "All numbers called! Congratulations, mga ka-bingo!"
+        room["announcement_id"] = uuid.uuid4().hex
+        room["announcement_kind"] = "system"
+        bump(room)
+        return False
+    number = random.choice(room["available_numbers"])
+    room["available_numbers"].remove(number)
+    room["called_numbers"].append(number)
+    room["message"] = (f"{', '.join(closed)} prize frozen. " if closed else "") + f"Number {number} was called. Waiting only for players who have it."
+    room["announcement"] = make_announcement(number, room["card_size"])
+    room["announcement_id"] = uuid.uuid4().hex
+    room["announcement_kind"] = "number"
+    set_current_call_window(room)
+    prewarm_audio(room["announcement"])
+    bump(room)
+    return True
+
+
+def auto_caller_loop():
+    while True:
+        time.sleep(0.5)
+        with LOCK:
+            now = time.time()
+            for room in list(ROOMS.values()):
+                if room.get("status") != "playing":
+                    continue
+                ready_snapshot = readiness_state(room)
+                if room.get("call_mode") != "auto":
+                    if ready_snapshot["timed_out"] and not room.get("deadline_notified"):
+                        room["deadline_notified"] = True
+                        bump(room)
+                    continue
+                if not room["called_numbers"]:
+                    if now >= room.get("next_auto_call_at", now + 999):
+                        perform_call_locked(room)
+                    continue
+                ready = readiness_state(room)
+                if ready["all_ready"]:
+                    if room.get("ready_since") is None:
+                        room["ready_since"] = now
+                        bump(room)
+                    due = room["ready_since"] + room.get("auto_interval", 5)
+                elif ready["timed_out"]:
+                    due = now
+                else:
+                    room["ready_since"] = None
+                    continue
+                if now >= due:
+                    perform_call_locked(room)
+
+
+threading.Thread(target=auto_caller_loop, daemon=True, name="bingo-auto-caller").start()
+
+
 def public_state(room, player_id):
     player = room["players"].get(player_id)
     return {
@@ -243,6 +358,9 @@ def public_state(room, player_id):
         "announcement_id": room.get("announcement_id", ""),
         "announcement_kind": room.get("announcement_kind", "system"),
         "audio_url": f"/api/audio/{room.get('announcement_id')}" if room.get("announcement_id") else "",
+        "call_mode": room.get("call_mode", "manual"),
+        "auto_interval": room.get("auto_interval", 5),
+        "readiness": readiness_state(room),
     }
 
 
@@ -294,12 +412,19 @@ def create_room():
     if not name: return jsonify(error="Enter your name."), 400
     if not MIN_PLAYERS <= max_players <= MAX_PLAYERS: return jsonify(error="Players must be between 2 and 20."), 400
     if card_size not in CARD_SIZES: return jsonify(error="Card size must be 3x3, 4x4, or 5x5."), 400
+    call_mode = str(data.get("call_mode", "manual")).lower()
+    if call_mode not in {"manual", "auto"}: call_mode = "manual"
+    try: auto_interval = int(data.get("auto_interval", 5))
+    except (TypeError, ValueError): auto_interval = 5
+    if auto_interval not in AUTO_INTERVALS: auto_interval = 5
     with LOCK:
         code, player_id = room_code(), uuid.uuid4().hex
         room = {"code": code, "host_id": player_id, "status": "lobby", "min_players": MIN_PLAYERS,
                 "max_players": max_players, "card_size": card_size, "players": {}, "called_numbers": [],
                 "available_numbers": card_number_pool(card_size), "created_at": time.time(), "version": 1,
-                "message": "Waiting for players to join…", "announcement": "", "announcement_id": "", "announcement_kind": "system"}
+                "message": "Waiting for players to join…", "announcement": "", "announcement_id": "", "announcement_kind": "system",
+                "call_mode": call_mode, "auto_interval": auto_interval, "call_started_at": 0, "call_deadline": 0,
+                "ready_since": None, "next_auto_call_at": 0}
         reset_prizes(room)
         room["players"][player_id] = {"name": name, "card": unique_card(room), "marked": set(), "version": 1}
         ROOMS[code] = room
@@ -365,11 +490,13 @@ def start_game():
         if len(room["players"]) < room["min_players"]: return jsonify(error="At least 2 players are required."), 409
         if room["status"] != "lobby": return jsonify(error="The game has already started."), 409
         room["status"], room["called_numbers"], room["available_numbers"] = "playing", [], card_number_pool(room["card_size"])
+        room["call_started_at"], room["call_deadline"], room["ready_since"] = 0, 0, None
+        room["next_auto_call_at"] = time.time() + 2
         reset_prizes(room)
         for p in room["players"].values():
             p["marked"] = set()
             p["version"] = p.get("version", 1) + 1
-        room["message"], room["announcement"] = "Game started. Host, call the first number!", "Game started! Good luck, mga ka-bingo!"
+        room["message"], room["announcement"] = ("Game started. Auto caller begins shortly!" if room.get("call_mode") == "auto" else "Game started. Host, call the first number!"), "Game started! Good luck, mga ka-bingo!"
         room["announcement_id"] = uuid.uuid4().hex
         room["announcement_kind"] = "system"
         bump(room)
@@ -383,32 +510,13 @@ def call_number():
         if not room or not player: return jsonify(error="Room not found."), 404
         if session["player_id"] != room["host_id"]: return jsonify(error="Only the host can call numbers."), 403
         if room["status"] != "playing": return jsonify(error="Start the game first."), 409
-        closed = close_pending_prizes(room)
-        if all(room["prizes"][key]["status"] == "closed" for key in PRIZE_KEYS):
-            room["status"] = "finished"
-            room["message"] = "All four prizes are frozen. The round is complete."
-            room["announcement"] = "Game complete! Congratulations to all our winners!"
-            room["announcement_id"] = uuid.uuid4().hex
-            room["announcement_kind"] = "system"
-            bump(room)
-            return jsonify(ok=True, finished=True, state=public_state(room, session["player_id"]))
-        if not room["available_numbers"]:
-            room["status"] = "finished"
-            room["message"] = "All available card numbers have been called. The round is complete."
-            room["announcement"] = "All numbers called! Congratulations, mga ka-bingo!"
-            room["announcement_id"] = uuid.uuid4().hex
-            room["announcement_kind"] = "system"
-            bump(room)
-            return jsonify(ok=True, finished=True, state=public_state(room, session["player_id"]))
-        number = random.choice(room["available_numbers"])
-        room["available_numbers"].remove(number); room["called_numbers"].append(number)
-        room["message"] = (f"{', '.join(closed)} prize frozen. " if closed else "") + f"Number {number} was called."
-        room["announcement"] = make_announcement(number, room["card_size"])
-        room["announcement_id"] = uuid.uuid4().hex
-        room["announcement_kind"] = "number"
-        prewarm_audio(room["announcement"])
-        bump(room)
-        return jsonify(ok=True, state=public_state(room, session["player_id"]))
+        if room.get("call_mode") == "auto": return jsonify(error="Auto caller is active for this room."), 409
+        ready = readiness_state(room)
+        if room["called_numbers"] and not ready["can_advance"]:
+            waiting = [p["name"] for p in ready["players"] if p["status"] == "waiting"]
+            return jsonify(error=f"Waiting for {', '.join(waiting)} to mark {ready['number']} ({ready['deadline_remaining']}s maximum)."), 409
+        perform_call_locked(room)
+        return jsonify(ok=True, finished=room["status"] == "finished", state=public_state(room, session["player_id"]))
 
 
 @app.post("/api/mark")
@@ -427,7 +535,9 @@ def mark_number():
             return jsonify(ok=True, already_marked=True, marked_numbers=sorted(player["marked"]), version=room["version"], player_version=player.get("version", 1))
         player["marked"].add(value)
         player["version"] = player.get("version", 1) + 1
-        return jsonify(ok=True, marked=True, marked_numbers=sorted(player["marked"]), version=room["version"], player_version=player["version"])
+        if room["called_numbers"] and value == room["called_numbers"][-1]:
+            bump(room)
+        return jsonify(ok=True, marked=True, marked_numbers=sorted(player["marked"]), version=room["version"], player_version=player["version"], state=public_state(room, session["player_id"]))
 
 
 @app.post("/api/mark-all")
@@ -450,6 +560,9 @@ def mark_all_called_numbers():
         added_count = len(player["marked"]) - before
         if added_count:
             player["version"] = player.get("version", 1) + 1
+            latest = room["called_numbers"][-1] if room["called_numbers"] else None
+            if latest in card_numbers:
+                bump(room)
         return jsonify(
             ok=True,
             added_count=added_count,
@@ -534,6 +647,7 @@ def restart_game():
         if not room or not player: return jsonify(error="Room not found."), 404
         if session["player_id"] != room["host_id"]: return jsonify(error="Only the host can restart."), 403
         room["status"], room["called_numbers"], room["available_numbers"] = "lobby", [], card_number_pool(room["card_size"])
+        room["call_started_at"], room["call_deadline"], room["ready_since"], room["next_auto_call_at"] = 0, 0, None, 0
         reset_prizes(room)
         existing = set()
         for p in room["players"].values():
