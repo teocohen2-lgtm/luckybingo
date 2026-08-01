@@ -12,16 +12,21 @@ try:
     import edge_tts
 except ImportError:  # Allows core game tests before optional voice dependency is installed.
     edge_tts = None
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, render_template, request, send_file, make_response
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-only-change-this-secret-key')
+AUDIO_SIGNER = URLSafeTimedSerializer(app.config['SECRET_KEY'], salt='lucky-bingo-audio-v1')
 
 ROOMS = {}
 TOKENS = {}  # reconnect_token -> (room_code, player_id)
 LOCK = threading.RLock()
 CHANGED = threading.Condition(LOCK)
 AUDIO_LOCK = threading.RLock()
+ANNOUNCEMENTS = {}  # announcement_id -> {'text': str, 'created_at': float}
+MAX_ANNOUNCEMENTS = 1000
 
 MIN_PLAYERS = 2
 MAX_PLAYERS = 20
@@ -36,7 +41,9 @@ PRIZE_LABELS = {'row': 'Row', 'column': 'Column', 'diagonal': 'Diagonal', 'all_o
 DEFAULT_PRIZES = {'row': 10.0, 'column': 10.0, 'diagonal': 10.0, 'all_out': 30.0}
 AUTO_INTERVALS = (3, 5, 8, 10, 15)
 MAX_READY_WAIT = 25
-VOICE = os.getenv('BINGO_VOICE', 'fil-PH-AngeloNeural')
+PRIMARY_VOICE = os.getenv('BINGO_VOICE', 'fil-PH-AngeloNeural')
+FALLBACK_VOICE = os.getenv('BINGO_FALLBACK_VOICE', 'en-PH-JamesNeural')
+VOICE_CANDIDATES = tuple(dict.fromkeys((PRIMARY_VOICE, FALLBACK_VOICE)))
 AUDIO_DIR = Path(os.getenv('BINGO_AUDIO_DIR', '/tmp/lucky_bingo_audio'))
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -144,39 +151,105 @@ def announcement(number, size):
     return f"{letter_for(number,size)}. {NUMBER_WORDS[number]}. {SPECIAL.get(number, random.choice(COMMENTS))}"
 
 
-def audio_path(text):
-    key = hashlib.sha256(f'{VOICE}|{text}'.encode()).hexdigest()[:28]
+def audio_path(text, voice):
+    key = hashlib.sha256(f'{voice}|{text}'.encode()).hexdigest()[:32]
     return AUDIO_DIR / f'{key}.mp3'
 
 
-def generate_audio(text, path):
+async def _stream_edge_tts(text, voice, tmp_path):
+    """Write only audio chunks. This is more reliable than Communicate.save()."""
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice=voice,
+        rate='-4%',
+        volume='+0%',
+        pitch='-2Hz',
+        connect_timeout=12,
+        receive_timeout=30,
+    )
+    audio_bytes = 0
+    with tmp_path.open('wb') as file_obj:
+        async for chunk in communicate.stream():
+            if chunk.get('type') == 'audio':
+                data = chunk.get('data') or b''
+                file_obj.write(data)
+                audio_bytes += len(data)
+    if audio_bytes < 500:
+        raise RuntimeError(f'No usable audio returned for voice {voice}')
+
+
+def generate_audio(text):
+    """
+    Generate a natural server MP3.
+
+    First choice: Filipino male Angelo.
+    Reliable fallback: English Philippines male James.
+    Both are neural server voices; browser speech synthesis is never used.
+    """
     if edge_tts is None:
-        raise RuntimeError('edge-tts is not installed')
-    tmp = path.with_suffix('.part.mp3')
-    last = None
-    for attempt in range(3):
-        try:
-            if tmp.exists(): tmp.unlink()
-            asyncio.run(edge_tts.Communicate(text, VOICE, rate='-4%', pitch='-2Hz').save(str(tmp)))
-            if not tmp.exists() or tmp.stat().st_size < 500: raise RuntimeError('empty audio')
-            tmp.replace(path)
-            return
-        except Exception as exc:
-            last = exc
-            time.sleep(.4 * (attempt + 1))
-    raise last or RuntimeError('voice generation failed')
+        raise RuntimeError('edge-tts is not installed. Run: pip install -r requirements.txt')
+
+    errors = []
+    for voice in VOICE_CANDIDATES:
+        path = audio_path(text, voice)
+        if path.exists() and path.stat().st_size >= 500:
+            return path, voice
+
+        tmp = path.with_suffix(f'.{uuid.uuid4().hex}.part.mp3')
+        for attempt in range(3):
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+                asyncio.run(_stream_edge_tts(text, voice, tmp))
+                if not tmp.exists() or tmp.stat().st_size < 500:
+                    raise RuntimeError('Generated audio file is empty')
+                os.replace(tmp, path)
+                return path, voice
+            except Exception as exc:
+                errors.append(f'{voice} attempt {attempt + 1}: {type(exc).__name__}: {exc}')
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                time.sleep(0.6 * (attempt + 1))
+
+    raise RuntimeError(' | '.join(errors[-6:]) or 'All neural voices failed')
+
+
+def signed_audio_url(text):
+    payload = AUDIO_SIGNER.dumps({'text': text})
+    return f'/api/audio/{payload}.mp3'
 
 
 def prewarm(text):
-    path = audio_path(text)
-    if path.exists(): return
+    """Generate in the background; the audio route can also generate on demand."""
     def run():
         try:
             with AUDIO_LOCK:
-                if not path.exists(): generate_audio(text, path)
-        except Exception: pass
+                generate_audio(text)
+        except Exception:
+            app.logger.exception('Background voice prewarm failed')
     threading.Thread(target=run, daemon=True).start()
 
+
+
+
+def register_announcement(room, text, kind='number'):
+    """Create a stable audio id that survives later room state changes."""
+    announcement_id = uuid.uuid4().hex
+    room['announcement'] = text
+    room['announcement_id'] = announcement_id
+    room['announcement_kind'] = kind
+    ANNOUNCEMENTS[announcement_id] = {'text': text, 'created_at': now()}
+
+    # Keep memory bounded while preserving recent calls across all active rooms.
+    if len(ANNOUNCEMENTS) > MAX_ANNOUNCEMENTS:
+        stale = sorted(ANNOUNCEMENTS.items(), key=lambda item: item[1]['created_at'])
+        for old_id, _ in stale[:len(ANNOUNCEMENTS) - MAX_ANNOUNCEMENTS]:
+            ANNOUNCEMENTS.pop(old_id, None)
+
+    prewarm(text)
+    return announcement_id
 
 def reset_round(room, first=False):
     room['round_number'] = room.get('round_number', 0) + (0 if first else 1)
@@ -251,11 +324,10 @@ def perform_call(room):
     room['available'].remove(number); room['called'].append(number)
     room['call_deadline'] = now() + MAX_READY_WAIT
     room['ready_since'] = None
-    room['announcement'] = announcement(number, room['card_size'])
-    room['announcement_id'] = uuid.uuid4().hex
-    room['announcement_kind'] = 'number'
+    text = announcement(number, room['card_size'])
+    register_announcement(room, text, 'number')
     room['message'] = f'{letter_for(number,room["card_size"])}-{number} called. Waiting for players who have it.'
-    prewarm(room['announcement']); bump(room); return True
+    bump(room); return True
 
 
 def room_state(room, pid):
@@ -274,7 +346,7 @@ def room_state(room, pid):
         'max_players':room['max_players'],'player_id':pid,'is_host':pid==room['host_id'],'player_name':p['name'],
         'card':p['card'],'marked':sorted(p['marked']),'called':room['called'],'last_number':room['called'][-1] if room['called'] else None,
         'remaining_numbers':len(room['available']),'message':room['message'],'announcement':room['announcement'],
-        'announcement_id':room['announcement_id'],'audio_url':f'/api/audio/{room["announcement_id"]}' if room['announcement_id'] else '',
+        'announcement_id':room['announcement_id'],'audio_url':signed_audio_url(room['announcement']) if room['announcement'] else '',
         'call_mode':room['call_mode'],'auto_interval':room['auto_interval'],'readiness':readiness(room),
         'prizes':prizes,'my_earnings':p['earnings'],'my_wins':p['wins'],'leaderboard':leaderboard,
         'round_history':room['round_history'][-10:],
@@ -436,7 +508,9 @@ def bingo():
                     prize['winners'].append(pid); p['wins']+=1; p['round_claims'].append(key); awarded.append(key); finalize_prize(room,key)
         if not awarded:return jsonify(error='No new valid prize pattern yet.'),409
         names=', '.join(PRIZE_LABELS[k] for k in awarded)
-        room['message']=f'{p["name"]} won {names}!'; room['announcement']=f'Congratulations, {p["name"]}! You won {names}. Panalo ka!'; room['announcement_id']=uuid.uuid4().hex; prewarm(room['announcement']); bump(room)
+        room['message']=f'{p["name"]} won {names}!'
+        register_announcement(room, f'Congratulations, {p["name"]}! You won {names}. Panalo ka!', 'winner')
+        bump(room)
         return jsonify(ok=True,awarded=awarded,state=room_state(room,pid))
 
 @app.post('/api/next-round')
@@ -466,23 +540,59 @@ def leave():
             room['message']=f'{name} left the room.'; bump(room)
     return jsonify(ok=True)
 
-@app.get('/api/audio/<announcement_id>')
-def audio(announcement_id):
-    text=None
-    with LOCK:
-        for room in ROOMS.values():
-            if room.get('announcement_id')==announcement_id:text=room.get('announcement');break
-    if not text:return jsonify(error='Audio expired.'),404
-    path=audio_path(text)
+@app.get('/api/audio/<path:signed_payload>.mp3')
+def audio(signed_payload):
+    """
+    The text is signed into the URL itself. Audio therefore does not depend on
+    ANNOUNCEMENTS, Flask process memory, polling state, or the newest room call.
+    """
+    try:
+        data = AUDIO_SIGNER.loads(signed_payload, max_age=60 * 60 * 24)
+        text = str(data.get('text', '')).strip()
+        if not text:
+            raise BadSignature('Missing announcement text')
+    except SignatureExpired:
+        return jsonify(error='Voice link expired. Repeat the latest call.'), 410
+    except BadSignature:
+        return jsonify(error='Invalid voice link.'), 404
+
     try:
         with AUDIO_LOCK:
-            if not path.exists():generate_audio(text,path)
-        return send_file(path,mimetype='audio/mpeg',conditional=True,max_age=86400)
+            path, used_voice = generate_audio(text)
+        response = send_file(path, mimetype='audio/mpeg', conditional=True, max_age=86400)
+        response.headers['Cache-Control'] = 'public, max-age=86400, immutable'
+        response.headers['X-Bingo-Voice'] = used_voice
+        return response
     except Exception as exc:
-        return jsonify(error='Voice temporarily unavailable.',fallback_text=text),503
+        app.logger.exception('Neural voice generation failed')
+        # Keep the exact technical detail in local/Render logs and expose a short
+        # diagnostic so the browser does not misleadingly report a 404.
+        return jsonify(
+            error='Natural voice generation failed.',
+            detail=str(exc)[:600],
+            primary_voice=PRIMARY_VOICE,
+            fallback_voice=FALLBACK_VOICE,
+        ), 503
+
+
+@app.get('/api/voice-health')
+def voice_health():
+    return jsonify(
+        ok=edge_tts is not None,
+        edge_tts_installed=edge_tts is not None,
+        primary_voice=PRIMARY_VOICE,
+        fallback_voice=FALLBACK_VOICE,
+        audio_directory=str(AUDIO_DIR),
+    )
+
+
+@app.get('/favicon.ico')
+def favicon():
+    return make_response('', 204)
+
 
 @app.get('/health')
 def health(): return jsonify(ok=True,rooms=len(ROOMS))
 
 if __name__=='__main__':
-    app.run(host='0.0.0.0',port=int(os.getenv('PORT','5000')),threaded=True)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT','5000')), threaded=True, use_reloader=False)
