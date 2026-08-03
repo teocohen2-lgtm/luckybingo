@@ -8,24 +8,20 @@ import time
 import uuid
 from pathlib import Path
 
-from openai import OpenAI
-
 from dotenv import load_dotenv
-
-
-
-
 
 try:
     import edge_tts
-except ImportError:  # Allows core game tests before optional voice dependency is installed.
+except ImportError:
     edge_tts = None
+
+
+
 from flask import Flask, jsonify, render_template, request, send_file, make_response
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 app = Flask(__name__)
 load_dotenv()
-api_key = os.environ.get("OPENAI_API_KEY")
 app.config['JSON_SORT_KEYS'] = False
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-only-change-this-secret-key')
 AUDIO_SIGNER = URLSafeTimedSerializer(app.config['SECRET_KEY'], salt='lucky-bingo-audio-v1')
@@ -51,9 +47,6 @@ PRIZE_LABELS = {'row': 'Row', 'column': 'Column', 'diagonal': 'Diagonal', 'all_o
 DEFAULT_PRIZES = {'row': 10.0, 'column': 10.0, 'diagonal': 10.0, 'all_out': 30.0}
 AUTO_INTERVALS = (3, 5, 8, 10, 15)
 MAX_READY_WAIT = 25
-PRIMARY_VOICE = os.getenv('BINGO_VOICE', 'fil-PH-AngeloNeural')
-FALLBACK_VOICE = os.getenv('BINGO_FALLBACK_VOICE', 'en-PH-JamesNeural')
-VOICE_CANDIDATES = tuple(dict.fromkeys((PRIMARY_VOICE, FALLBACK_VOICE)))
 AUDIO_DIR = Path(os.getenv('BINGO_AUDIO_DIR', '/tmp/lucky_bingo_audio'))
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -193,44 +186,9 @@ SPECIAL = {
     75: "Seventy-five! Last ball! Kung wala pa ring bingo... gcash na lang ang kulang!"
 }
 
-OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
-
-# Recommended by OpenAI for higher voice quality.
-OPENAI_TTS_VOICES = [
-    "cedar",
-    "marin",
-    "onyx",
-]
-
-
-BINGO_VOICE_INSTRUCTIONS = """
-Speak like a real Filipino male bingo host talking live to close friends.
-
-Voice and personality:
-- Filipino male, approximately 30 to 40 years old.
-- Natural Filipino English accent.
-- Warm, confident, playful, slightly naughty, and very funny.
-- Sound spontaneous, not like a narrator reading written text.
-- Speak as though people are reacting live in front of you.
-- Mix English and Tagalog naturally.
-- Approximately 40 percent English and 60 percent Tagalog.
-- Smile while speaking so the smile can be heard in the voice.
-- Add realistic emotion, changing intonation, and conversational rhythm.
-- Use natural pauses, small breaths, and occasional soft chuckles.
-- Expressions such as "ayieee", "naku", "hala", and "haha" should sound natural.
-- Tease the players playfully, but never sound insulting or aggressive.
-- Clearly emphasize the bingo letter and called number.
-- Build a little excitement before the joke.
-- Do not use a formal radio-announcer tone.
-- Do not sound robotic, overly polished, or like an audiobook.
-- Do not rush the number.
-- Keep the performance energetic without shouting.
-
-Delivery example:
-Start clearly with the letter and number, pause briefly, then deliver the
-comment like a live joke directed at the players. Slightly laugh when the
-sentence is genuinely funny, rather than laughing after every line.
-"""
+PRIMARY_VOICE = os.getenv('BINGO_VOICE', 'fil-PH-AngeloNeural')
+FALLBACK_VOICE = os.getenv('BINGO_FALLBACK_VOICE', 'en-PH-JamesNeural')
+VOICE_CANDIDATES = tuple(dict.fromkeys((PRIMARY_VOICE, FALLBACK_VOICE)))
 
 def now(): return time.time()
 
@@ -313,17 +271,20 @@ def audio_path(text, voice):
     return AUDIO_DIR / f'{key}.mp3'
 
 
+
+
 async def _stream_edge_tts(text, voice, tmp_path):
-    """Write only audio chunks. This is more reliable than Communicate.save()."""
+    """Stream Edge neural speech into an MP3 file."""
     communicate = edge_tts.Communicate(
         text=text,
         voice=voice,
-        rate='-4%',
+        rate='+4%',
         volume='+0%',
-        pitch='-2Hz',
-        connect_timeout=12,
-        receive_timeout=30,
+        pitch='-1Hz',
+        connect_timeout=10,
+        receive_timeout=25,
     )
+
     audio_bytes = 0
     with tmp_path.open('wb') as file_obj:
         async for chunk in communicate.stream():
@@ -331,136 +292,50 @@ async def _stream_edge_tts(text, voice, tmp_path):
                 data = chunk.get('data') or b''
                 file_obj.write(data)
                 audio_bytes += len(data)
+
     if audio_bytes < 500:
-        raise RuntimeError(f'No usable audio returned for voice {voice}')
-
-
-# def generate_audio(text):
-#     """
-#     Generate a natural server MP3.
-
-#     First choice: Filipino male Angelo.
-#     Reliable fallback: English Philippines male James.
-#     Both are neural server voices; browser speech synthesis is never used.
-#     Speak like a cheerful Filipino male bingo host.
-
-# Voice:
-# - Male, around 30-40 years old.
-# - Native Filipino accent speaking English naturally.
-# - Energetic, playful and funny.
-# - Sounds like a live bingo announcer in the Philippines.
-# - Smile while speaking.
-# - Natural pauses.
-# - Slight excitement after every number.
-# - Never sound robotic or like reading a script.
-# - English with natural Tagalog code-switching.
-# - Friendly, warm and conversational.
-# - Occasionally laugh softly: "haha", "ayieee", "naku!"
-# - Emphasize the called number clearly.
-#     """
-#     if edge_tts is None:
-#         raise RuntimeError('edge-tts is not installed. Run: pip install -r requirements.txt')
-
-#     errors = []
-#     for voice in VOICE_CANDIDATES:
-#         path = audio_path(text, voice)
-#         if path.exists() and path.stat().st_size >= 500:
-#             return path, voice
-
-#         tmp = path.with_suffix(f'.{uuid.uuid4().hex}.part.mp3')
-#         for attempt in range(3):
-#             try:
-#                 if tmp.exists():
-#                     tmp.unlink()
-#                 asyncio.run(_stream_edge_tts(text, voice, tmp))
-#                 if not tmp.exists() or tmp.stat().st_size < 500:
-#                     raise RuntimeError('Generated audio file is empty')
-#                 os.replace(tmp, path)
-#                 return path, voice
-#             except Exception as exc:
-#                 errors.append(f'{voice} attempt {attempt + 1}: {type(exc).__name__}: {exc}')
-#                 try:
-#                     tmp.unlink(missing_ok=True)
-#                 except Exception:
-#                     pass
-#                 time.sleep(0.6 * (attempt + 1))
-
-#     raise RuntimeError(' | '.join(errors[-6:]) or 'All neural voices failed')
-
+        raise RuntimeError(f'No usable audio returned for {voice}')
 
 
 def generate_audio(text):
-    """
-    Generate an expressive server-side MP3 using prompt-controlled AI speech.
+    """Generate and cache fast Edge neural speech as an MP3 file."""
+    text = str(text or '').strip()
+    if not text:
+        raise ValueError('Cannot generate audio for empty text.')
+    if edge_tts is None:
+        raise RuntimeError('edge-tts is not installed. Run: pip install edge-tts')
 
-    Returns:
-        tuple[Path, str]: Generated MP3 path and selected voice name.
-    """
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    if not api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY is missing. Add it to your environment variables."
-        )
-
-    client = OpenAI(api_key=api_key)
     errors = []
-
-    for voice in OPENAI_TTS_VOICES:
-        path = audio_path(
-            text,
-            f"{OPENAI_TTS_MODEL}-{voice}",
-        )
-
-        if path.exists() and path.stat().st_size >= 1000:
+    for voice in VOICE_CANDIDATES:
+        path = audio_path(text, voice)
+        if path.exists() and path.stat().st_size >= 500:
             return path, voice
 
-        tmp = path.with_suffix(
-            f".{uuid.uuid4().hex}.part.mp3"
-        )
-
-        for attempt in range(3):
+        tmp = path.with_suffix(f'.{uuid.uuid4().hex}.part.mp3')
+        for attempt in range(2):
             try:
-                tmp.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
                 tmp.unlink(missing_ok=True)
+                asyncio.run(_stream_edge_tts(text, voice, tmp))
 
-                with client.audio.speech.with_streaming_response.create(
-                    model=OPENAI_TTS_MODEL,
-                    voice=voice,
-                    input=text,
-                    instructions=BINGO_VOICE_INSTRUCTIONS,
-                    response_format="mp3",
-                ) as response:
-                    response.stream_to_file(tmp)
-
-                if not tmp.exists() or tmp.stat().st_size < 1000:
-                    raise RuntimeError(
-                        "Generated audio file is empty or incomplete."
-                    )
+                if not tmp.exists() or tmp.stat().st_size < 500:
+                    raise RuntimeError('Generated audio file is empty')
 
                 os.replace(tmp, path)
                 return path, voice
-
             except Exception as exc:
                 errors.append(
-                    f"{voice} attempt {attempt + 1}: "
-                    f"{type(exc).__name__}: {exc}"
+                    f'{voice} attempt {attempt + 1}: '
+                    f'{type(exc).__name__}: {exc}'
                 )
-
                 try:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
-
-                time.sleep(0.8 * (attempt + 1))
+                time.sleep(0.25 * (attempt + 1))
 
     raise RuntimeError(
-        " | ".join(errors[-6:])
-        or "All expressive AI voices failed."
+        'Fast neural voice generation failed. '
+        + (' | '.join(errors[-4:]) if errors else 'No voice returned audio.')
     )
 
 def signed_audio_url(text):
@@ -873,11 +748,33 @@ def audio(signed_payload):
 def voice_health():
     return jsonify(
         ok=edge_tts is not None,
+        provider='edge-tts',
         edge_tts_installed=edge_tts is not None,
         primary_voice=PRIMARY_VOICE,
         fallback_voice=FALLBACK_VOICE,
         audio_directory=str(AUDIO_DIR),
+        message=(
+            'Fast neural bingo voice is ready.'
+            if edge_tts is not None
+            else 'edge-tts is not installed.'
+        ),
     )
+
+
+@app.get('/api/voice-test')
+def voice_test():
+    text = (
+        'B. twelve. Hoy mga ka-bingo, check your card muna! '
+        'Huwag puro chika, baka lumampas ang swerte mo!'
+    )
+    try:
+        path, used_voice = generate_audio(text)
+        response = send_file(path, mimetype='audio/mpeg', conditional=True, max_age=86400)
+        response.headers['X-Bingo-Voice'] = used_voice
+        return response
+    except Exception as exc:
+        app.logger.exception('Fast voice test failed')
+        return jsonify(error='Fast voice test failed.', detail=str(exc)[:600]), 503
 
 
 @app.get('/favicon.ico')
